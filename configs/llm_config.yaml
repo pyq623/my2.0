@@ -1,0 +1,19 @@
+# tinyml/configs/llm_config.yaml
+llm:
+  model_name: "deepseek-coder"
+  temperature: 0.3
+  base_url: "https://api.deepseek.com/beta"  # 替换为你的实际URL
+  api_key: "sk-55e7139dccac439699f922cbe580c465"             # 替换为你的实际 API key
+
+# llm = MemoryModelLLM(
+    #     api_key="sk-55e7139dccac439699f922cbe580c465",
+    #     api_base="https://api.deepseek.com/beta",
+    #     model_name="deepseek-coder"
+    # )
+
+  # model_name: "gpt-4o"
+  # temperature: 0.3
+  # base_url: "https://xiaoai.plus/v1"  # 替换为你的实际URL
+  # api_key: "sk-dDIkinRQSn15Q1nMd7rI6jL1G0YIIGMcf278XyxyoNOTwjWD"   
+memory:
+  max_history: 5  # 最大历史消息数

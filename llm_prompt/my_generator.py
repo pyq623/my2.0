@@ -92,6 +92,14 @@ class LLMConfigGenerator:
             4. SeSepConvBlock: Depthwise separable convolution with SE module (Depthwise + SE + Pointwise) structure.
             5. SeDpConvBlock: Depthwise convolution with SE module (Depthwise + SE) structure without Pointwise convolution.
         
+        **Quantization Modes (IMPORTANT):**
+            - none: No quantization - standard FP32 model (baseline)
+            - static: Post-training static quantization - applies INT8 quantization after training (fast but may lose accuracy)
+            - qat: Quantization-Aware Training - simulates quantization effects during training to improve accuracy after quantization
+            - qaft: Quantization-Aware Fine-Tuning - fine-tunes a pre-trained model with quantization awareness to recover accuracy lost during quantization
+            * RECOMMENDED for best accuracy-efficiency trade-off
+            * Quantization may yield dramatic degration or slight degration in accuracy depending on model architecture.
+
         **Important Notes:**
             - In the search space, "DWSepConv" and "MBConv" both refer to "DWSepConv1D" and "MBConv1D", but when you generate the configuration, you should only write "DWSepConv" and "MBConv" according to the instructions in the search space.
             - If has_se is set to False, then se_ratios will be considered as 0, and vice versa. Conversely, if Has_se is set to True, then se_ratios must be greater than 0, and the same holds true in reverse.
@@ -140,7 +148,7 @@ class LLMConfigGenerator:
         - Directions Explored: {directions_explored}
 
         Optimization Direction: {direction}
-        (e.g., 'none' for origianl model without quantization, 'static' for static quantization, 'qat' for quantization-aware training)
+        (e.g., 'none' for origianl model without quantization, 'static' for static quantization, 'qat' for quantization-aware training, 'qaft' for Quantization-Aware Fine-Tuning.)
 
         {memory_feedback}
         

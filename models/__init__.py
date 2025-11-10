@@ -8,8 +8,18 @@ TinyML 模型定义模块
 
 # 从候选模型模块导入
 from .candidate_models import CandidateModel
-from .QuantizableModel import QuantizableModel, get_static_quantization_config, get_quantization_option, \
-    print_available_quantization_options, apply_configurable_static_quantization, fuse_model_modules, fuse_QATmodel_modules
+from .QuantizableModel import (
+    QuantizableModel, 
+    get_static_quantization_config, 
+    get_quantization_option, 
+    print_available_quantization_options, 
+    apply_configurable_static_quantization, 
+    fuse_model_modules, 
+    fuse_QATmodel_modules, 
+    prepare_qaft_model,        # ✅ 新增
+    apply_qaft_quantization,   # ✅ 新增
+    evaluate_quantized_model,
+    STATIC_QUANTIZATION_OPTIONS)
 # 从卷积块模块导入
 from .conv_blocks import (
     DWSepConvBlock,
@@ -38,7 +48,11 @@ __all__ = [
     'apply_configurable_static_quantization',
     'fuse_model_modules',
     'fuse_QATmodel_modules',
-    'TinyMLModel'
+    'prepare_qaft_model',        # ✅ 新增
+    'apply_qaft_quantization',   # ✅ 新增
+    'evaluate_quantized_model',
+    'TinyMLModel',
+    'STATIC_QUANTIZATION_OPTIONS'
 ]
 
 # 版本信息

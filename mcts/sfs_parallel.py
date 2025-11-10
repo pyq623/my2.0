@@ -275,12 +275,22 @@ class ParallelScatteredForestSearch:
                     new_candidate = CandidateModel(config=new_config)
                     new_candidate.candidate_id = result_id
                     new_candidate.metrics = metrics
+
+                    # ✅ 新增：记录元信息
+                    new_candidate.iteration = completed_count
+                    new_candidate.parent_id = current_node.node_id
+                    new_candidate.parent_direction = direction
+                    new_candidate.root_seed_id = self._get_root_seed_id(current_node)
                     
                     child_node = MCTSNode(
                         node_id=result_id,
                         candidate=new_candidate,
                         directions=current_node.directions.copy()
                     )
+
+                    # ✅ 记录迭代信息到节点
+                    child_node.iteration = completed_count
+
                     child_node.update_reward(reward)
                     
                     # 添加到树
@@ -351,6 +361,21 @@ class ParallelScatteredForestSearch:
         print(f"\n✅ 搜索完成！共完成 {completed_count} 次迭代")
         self._stop_workers()
     
+    def _get_root_seed_id(self, node: MCTSNode) -> str:
+        """追溯到根种子"""
+        current = node
+        while not current.is_forest_root:
+            # 找父节点
+            parent_found = False
+            for potential_parent in self.tree.nodes.values():  # ✅ 修正
+                if current.node_id in [c.node_id for c in potential_parent.children.values()]:
+                    current = potential_parent
+                    parent_found = True
+                    break
+            if not parent_found:
+                break
+        return current.node_id
+
     # 以下方法与原版相同
     def _simulate_from_seed(self, seed_node: MCTSNode) -> Tuple[MCTSNode, List]:
         """从种子模拟（与原版相同）"""
@@ -418,12 +443,34 @@ class ParallelScatteredForestSearch:
         
         # 🔵 重试机制
         memory_feedback = None
+        llm_failed = False  # 新增：标记LLM是否失败
+
         for attempt in range(self.max_retry_attempts + 1):
+            # ✅ 如果LLM连续2次失败，直接切换到降级策略
             try:
-                new_config = self.llm_config_generator.generate_config_with_context(
-                    parent_config, direction, parent_performance, global_insights,
-                    memory_feedback=memory_feedback
-                )
+                # 🔵 如果LLM失败，直接使用降级配置，不再重试LLM
+                if attempt >= 2 and (llm_failed or memory_feedback is not None):
+                    print(f"⚠️ LLM已失败，使用降级配置 (尝试 {attempt+1}/{self.max_retry_attempts+1})")
+                    # ✅ 修正：传入一个超过限制的值，触发降级策略
+                    # 使用 max_memory * 2.0 表示需要强力降级到安全范围
+                    new_config = self.degradation_manager.generate_degraded_config(
+                        parent_config, direction, self.max_memory
+                    )
+                else:
+                    try:
+                        # 🔵 调用LLM生成配置
+                        new_config = self.llm_config_generator.generate_config_with_context(
+                            parent_config, direction, parent_performance, global_insights,
+                            memory_feedback=memory_feedback
+                        )
+                        
+                    except Exception as llm_e:
+                        print(f"❌ LLM调用失败: {llm_e}")
+                        llm_failed = True
+                        # ✅ 修正：同样传入超过限制的值
+                        new_config = self.degradation_manager.generate_degraded_config(
+                            parent_config, direction, self.max_memory
+                        )
                 print(f"🔧 生成配置 (尝试 {attempt+1}/{self.max_retry_attempts+1})")
 
                 # 🔵 检查内存约束
@@ -433,6 +480,18 @@ class ParallelScatteredForestSearch:
                 # 🔵 检查是否重复
                 if self._is_duplicate_config(new_config):
                     print(f"🔁 LLM生成重复配置 (尝试 {attempt+1}/{self.max_retry_attempts+1})")
+
+                    # 如果是最后一次尝试，强制使用降级配置并添加随机扰动
+                    if attempt == self.max_retry_attempts:
+                        print("🚨 达到最大重试次数，使用强制降级配置")
+                        # 使用降级配置，但指定不同的内存预算以获得不同的配置
+                        import random
+                        # ✅ 修正：使用当前测量的内存值，或者使用一个略高于限制的值
+                        fallback_memory = memory_usage if memory_usage > 0 else self.max_memory * 1.1
+                        return self.degradation_manager.generate_degraded_config(
+                            parent_config, direction, fallback_memory
+                        )
+
                     memory_feedback = f"""
                     The previous model config: {json.dumps(new_config)}
                     The generated configuration is a DUPLICATE of a previously seen model. 
@@ -463,34 +522,47 @@ class ParallelScatteredForestSearch:
                             parent_config, direction, memory_usage
                         )
 
+                    # ✅ 改进后的反馈（更具体、更智能）
+                    reduction_needed = memory_usage / self.max_memory
+                    specific_suggestions = []
+
+                    if reduction_needed > 1.5:
+                        specific_suggestions.append("CRITICAL: Memory is 50%+ over limit. Reduce stages to 2-3 maximum")
+                        specific_suggestions.append(f"Set all channel numbers to 8-16 range")
+                    elif reduction_needed > 1.2:
+                        specific_suggestions.append(f"Reduce channel numbers by ~{int((reduction_needed-1)*100)}%")
+                        specific_suggestions.append("Remove 1-2 blocks from each stage")
+
+                    # 添加"避免重复"的指导
+                    if attempt > 1:
+                        specific_suggestions.append("⚠️ IMPORTANT: Previous attempts generated duplicates. Try:")
+                        specific_suggestions.append("  - Use different conv types (e.g., DpConv instead of SeDpConv)")
+                        specific_suggestions.append(f"  - Use unusual channel numbers (e.g., 11, 13, 19 instead of 8, 16)")
+                        specific_suggestions.append("  - Vary expansion ratios (2, 3, 5 instead of common 4, 6)")
+
+
                     # 更新反馈，要求减少内存
                     memory_feedback = f"""
-                    The previous model config: {json.dumps(new_config)}
-                    The generated model configuration memory usage is {memory_usage:.2f}MB, 
-                    EXCEEDING the maximum limit of {self.max_memory}MB.
+                    Previous config memory: {memory_usage:.2f}MB (limit: {self.max_memory}MB)
+                    Over budget by: {(reduction_needed-1)*100:.0f}%
+                    
+                    SPECIFIC ACTIONS REQUIRED:
+                    {chr(10).join(f'{i+1}. {s}' for i, s in enumerate(specific_suggestions))}
 
-                    Please generate a LIGHTER configuration. This is attempt {attempt+1}/{self.max_retry_attempts}.
-
-                    Critical suggestions to reduce memory:
-                    1. REDUCE the number of stages (currently: {len(new_config.get('stages', []))})
-                    2. REDUCE the number of blocks per stage
-                    3. Use SIMPLER convolution types (prefer: SeDpConv > DpConv > SeSepConv)
-                    4. REDUCE channel numbers (currently: {[s.get('channels') for s in new_config.get('stages', [])]})
-                    5. DISABLE SE modules (has_se: false)
-                    6. REDUCE expansion ratios
+                    Current config:\n {json.dumps(new_config, indent=2)}
                     """
             except Exception as e:
                 print(f"❌ LLM配置生成失败 (尝试 {attempt+1}): {e}")
                 if attempt == self.max_retry_attempts:
                     # ✅ 调用降级管理器
                     return self.degradation_manager.generate_degraded_config(
-                        parent_config, direction, 0
+                        parent_config, direction, self.max_memory
                     )
                 
         # 最终回退
         print("🚨 所有尝试失败，使用降级配置")
-        # return new_config
-        return self.degradation_manager.generate_degraded_config(parent_config, direction, 0)
+        # ✅ 修正：传入超过限制的值触发降级
+        return self.degradation_manager.generate_degraded_config(parent_config, direction, self.max_memory)
         
 
     def _backpropagate(self, trajectory: List, reward: float):

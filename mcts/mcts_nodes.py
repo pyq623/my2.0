@@ -454,13 +454,147 @@ class MCTSTree:
     
     def save_graph_info(self, filepath: str):
         """保存图结构信息到文件"""
+        # 1. 计算每个节点的树深度和所属种子
+        node_depths = {}
+        node_root_seeds = {}
+
+        def compute_depth_and_seed(node_id: str, current_depth: int = 0, root_seed: str = None):
+            """递归计算深度和所属种子"""
+            if node_id in node_depths:
+                return
+            
+            node = self.nodes.get(node_id)
+            if not node:
+                return
+            
+            # 如果是森林根节点，它就是自己的根种子
+            if node.is_forest_root:
+                root_seed = node_id
+                current_depth = 0
+            
+            node_depths[node_id] = current_depth
+            node_root_seeds[node_id] = root_seed
+            
+            # 递归处理子节点
+            for direction, child in node.children.items():
+                compute_depth_and_seed(child.node_id, current_depth + 1, root_seed)
+        
+        # 为所有森林根节点计算深度
+        for root in self.forest_roots:  # ✅ 修正
+            compute_depth_and_seed(root.node_id)  # ✅ 修正
+        
+        # 2. 构建节点信息（增强版）
+        nodes_info = {}
+        for node_id, node in self.nodes.items():  # ✅ 修正
+            # 找到父节点信息
+            parent_id = None
+            parent_direction = None
+            for potential_parent_id, potential_parent in self.nodes.items():  # ✅ 修正
+                for direction, child in potential_parent.children.items():
+                    if child.node_id == node_id:
+                        parent_id = potential_parent_id
+                        parent_direction = direction
+                        break
+            
+            # ✅ 增强的节点信息
+            nodes_info[node_id] = {
+                "node_id": node_id,
+                "candidate_config": node.candidate.config if node.candidate else None,
+                "metrics": {
+                    "accuracy": node.candidate.metrics.get('accuracy', 0.0) if node.candidate else 0.0,
+                    "latency": node.candidate.metrics.get('latency', 0.0) if node.candidate else 0.0,
+                    "peak_memory": node.candidate.metrics.get('peak_memory', 0.0) if node.candidate else 0.0
+                },
+                "visit_count": node.visit_count,
+                "average_reward": node.average_reward,
+                "children_directions": list(node.children.keys()),
+                "direction_stats": {
+                    direction: {
+                        "q_value": node.direction_q_values.get(direction, 0.0),
+                        "visits": node.direction_visits.get(direction, 0)
+                    }
+                    for direction in node.directions
+                },
+                # ✅ 新增：树结构元信息
+                "tree_metadata": {
+                    "depth": node_depths.get(node_id, 0),
+                    "root_seed_id": node_root_seeds.get(node_id, None),
+                    "iteration": getattr(node, 'iteration', None),  # 需要在创建节点时设置
+                    "is_forest_root": node.is_forest_root
+                },
+                # ✅ 增强：图结构信息
+                "graph_info": {
+                    "node_id": node_id,
+                    "parent_id": parent_id,
+                    "parent_direction": parent_direction,
+                    "children_count": len(node.children),
+                    "children_ids": [child.node_id for child in node.children.values()],
+                    "is_forest_root": node.is_forest_root
+                }
+            }
+
         import json
+        # graph_data = {
+        #     "statistics": self.get_graph_statistics(),
+        #     "forest_roots": [root.node_id for root in self.forest_roots],
+        #     "nodes": {node_id: node.to_dict() for node_id, node in self.nodes.items()},
+        #     "global_insights": self.global_insights,
+        # }
+        # 3. 构建完整的图结构数据
         graph_data = {
             "statistics": self.get_graph_statistics(),
-            "forest_roots": [root.node_id for root in self.forest_roots],
-            "nodes": {node_id: node.to_dict() for node_id, node in self.nodes.items()},
-            "global_insights": self.global_insights
+            "forest_roots": self.forest_roots,
+            "nodes": nodes_info,
+            # ✅ 新增：全局洞察
+            "global_insights": self.global_insights,
+            # ✅ 新增：用于LLaMA3训练的轨迹数据
+            "training_trajectories": self._extract_training_trajectories(nodes_info)
         }
         
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(graph_data, f, indent=2, ensure_ascii=False, default=str)
+    
+    def _extract_training_trajectories(self, nodes_info: dict) -> list:
+        """提取用于LLaMA3训练的轨迹数据"""
+        trajectories = []
+        
+        for node_id, node_data in nodes_info.items():
+            # 跳过森林根节点（没有父节点）
+            if node_data['graph_info']['parent_id'] is None:
+                continue
+            
+            parent_id = node_data['graph_info']['parent_id']
+            parent_direction = node_data['graph_info']['parent_direction']
+            
+            if parent_id in nodes_info:
+                parent_data = nodes_info[parent_id]
+                
+                # ✅ 构建训练样本：parent_config + direction → child_config + reward
+                trajectory = {
+                    "trajectory_id": f"{parent_id}_to_{node_id}",
+                    "parent": {
+                        "node_id": parent_id,
+                        "config": parent_data['candidate_config'],
+                        "reward": parent_data['average_reward'],
+                        "visit_count": parent_data['visit_count']
+                    },
+                    "action": {
+                        "direction": parent_direction,
+                        "q_value": parent_data['direction_stats'].get(parent_direction, {}).get('q_value', 0.0)
+                    },
+                    "child": {
+                        "node_id": node_id,
+                        "config": node_data['candidate_config'],
+                        "reward": node_data['average_reward'],
+                        "metrics": node_data['metrics']
+                    },
+                    "context": {
+                        "depth": node_data['tree_metadata']['depth'],
+                        "root_seed_id": node_data['tree_metadata']['root_seed_id'],
+                        "iteration": node_data['tree_metadata']['iteration']
+                    }
+                }
+                
+                trajectories.append(trajectory)
+        
+        return trajectories

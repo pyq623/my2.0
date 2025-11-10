@@ -36,7 +36,7 @@ class LLMConfigGenerator:
             # 使用便捷函数调用 LLM
             response = call_llm_with_messages(system_prompt, human_prompt)
             
-            print(f"🔍 调试信息 - LLM 响应: {response[:200]}...")  # 只打印前 200 个字符
+            print(f"🔍 调试信息 - LLM 响应: {response}")  # 只打印前 200 个字符
 
             # 解析响应并提取 JSON 配置
             new_config = self._parse_llm_response(response)
@@ -92,6 +92,16 @@ class LLMConfigGenerator:
             4. SeSepConvBlock: Depthwise separable convolution with SE module (Depthwise + SE + Pointwise) structure.
             5. SeDpConvBlock: Depthwise convolution with SE module (Depthwise + SE) structure without Pointwise convolution.
         
+        **CRITICAL: Memory Consumption Ranking (Single Stage, Single Block Comparison):**
+            Based on typical configuration(kernel size:3, channel:9):
+        
+            LIGHTEST → HEAVIEST:
+            1. SeDpConv:   ~1.6 MB  (Only Depthwise + SE, NO Pointwise - MOST LIGHTWEIGHT)
+            2. DpConv:     ~2.7 MB  (Depthwise + Pointwise, no SE)
+            3. DWSepConv:  ~3.3 MB  (Depthwise + Pointwise + optional skip)
+            4. SeSepConv:  ~3.3 MB  (Depthwise + SE + Pointwise)
+            5. MBConv:     ~7.7 MB  (Expansion + Depthwise + SE + Pointwise - MOST HEAVY)
+
         **Quantization Modes (IMPORTANT):**
             - none: No quantization - standard FP32 model (baseline)
             - static: Post-training static quantization - applies INT8 quantization after training (fast but may lose accuracy)
@@ -99,6 +109,10 @@ class LLMConfigGenerator:
             - qaft: Quantization-Aware Fine-Tuning - fine-tunes a pre-trained model with quantization awareness to recover accuracy lost during quantization
             * RECOMMENDED for best accuracy-efficiency trade-off
             * Quantization may yield dramatic degration or slight degration in accuracy depending on model architecture.
+            • Quantization modes (static/qat/qaft) ALWAYS reduce model memory to EXACTLY 1/4 of FP32 size (INT8 = 8 bits vs FP32 = 32 bits)
+            • Example: If FP32 model uses 20MB, quantized version uses 5MB
+            • When designing for quantized modes, you can use 4x larger architectures!
+            • When designing for 'none' mode, be extremely conservative with memory, must fit within the given memory constraint.
 
         **Important Notes:**
             - In the search space, "DWSepConv" and "MBConv" both refer to "DWSepConv1D" and "MBConv1D", but when you generate the configuration, you should only write "DWSepConv" and "MBConv" according to the instructions in the search space.
@@ -150,7 +164,7 @@ class LLMConfigGenerator:
         Optimization Direction: {direction}
         (e.g., 'none' for origianl model without quantization, 'static' for static quantization, 'qat' for quantization-aware training, 'qaft' for Quantization-Aware Fine-Tuning.)
 
-        {memory_feedback}
+        {memory_feedback_section}
         
         TASK: Generate a new improved network configuration that:
         1. Uses the specified direction: {direction}
@@ -218,7 +232,7 @@ class LLMConfigGenerator:
             directions_explored = directions_explored,
             max_peak_memory=max_peak_memory,
             search_space=json.dumps(self.search_space, indent=2),
-            memory_feedback=memory_feedback_section  
+            memory_feedback_section=memory_feedback_section  
         )
         return human_prompt
     
@@ -288,6 +302,7 @@ class LLMConfigGenerator:
                     # 应用通道修复
                     fixed_channels = block['_stage_channels_fixed']
                     stage['channels'] = fixed_channels
+                    stage_channels = fixed_channels  # 🟢 添加这一行
                     print(f"Applied SeDpConv channel fix: stage {stage_idx} channels set to {fixed_channels}")
                     # 移除临时标记
                     del block['_stage_channels_fixed']
@@ -301,7 +316,161 @@ class LLMConfigGenerator:
                     else:
                         current_channels = stage['channels']
         
+        # ✅ 新增：内存检查和自动缩减
+        max_memory = self.constraint.get("max_peak_memory", None)
+        if max_memory is not None:
+            # ✅ 关键修复：确保 max_memory 是浮点数
+            max_memory = float(max_memory) / 1e6  # 转换为MB（如果原始单位是字节）
+            print(f"max_memory:{max_memory} MB")
+            from models import CandidateModel
+            from utils import calculate_memory_usage
+            
+            candidate = CandidateModel(config=config)
+            model = candidate.build_model()
+            memory_info = calculate_memory_usage(model, input_size=(64, config['input_channels'], 100), device='cpu')
+            memory_usage = memory_info["total_memory_MB"]
+            
+            # 考虑量化压缩
+            if config.get('quant_mode') in ["static", "qat", "qaft"]:
+                memory_usage /= 4.0
+            
+            # 如果超过限制，自动缩减
+            if memory_usage > max_memory:
+                print(f"⚠️ 配置内存 {memory_usage:.2f}MB 超过 {max_memory}MB，自动缩减...")
+                config = self._auto_reduce_memory(config, memory_usage, max_memory)
         return config
+    
+    def _auto_reduce_memory(self, config: Dict[str, Any], current_memory: float, 
+                       target_memory: float) -> Dict[str, Any]:
+        """智能缩减配置以满足内存约束 - 遵循 search_space 约束"""
+        
+        # 计算需要缩减的比例
+        reduction_ratio = target_memory / current_memory * 0.9  # 留10%余量
+        
+        print(f"🔧 目标缩减比例: {reduction_ratio:.2f}")
+        
+        # ✅ 修复：从 search_space 获取合法的通道数选项，并确保转为整数
+        valid_channels = self.search_space.get('channels', [8, 16, 24, 32])
+        
+        # ✅ 关键修复： 确保所有通道数都是整数类型
+        valid_channels = sorted([int(c) for c in valid_channels])  # 转为 int 并排序
+        print(f"📋 合法通道数选项: {valid_channels}")
+        
+        # 获取 input_channels（用于 SeDpConv 特殊处理）
+        input_channels = config.get('input_channels', 9)
+        
+        # 策略1: 智能缩减所有stage的通道数（选择search_space中最接近的值）
+        for stage_idx, stage in enumerate(config['stages']):
+            
+            old_channels = int(stage['channels'])  # ✅ 确保是整数
+            
+            # 计算目标通道数
+            target_channels = int(old_channels * reduction_ratio)
+            
+            # ✅ 特殊处理：检查这个stage是否包含SeDpConv
+            has_sedpconv = any(block.get('type') == 'SeDpConv' for block in stage.get('blocks', []))
+            
+            if has_sedpconv:
+                # SeDpConv 要求 in_channels == out_channels
+                if stage_idx == 0:
+                    # 第一个 stage 必须等于 input_channels
+                    new_channels = input_channels
+                    print(f"  - Stage {stage_idx} (SeDpConv): 保持 {new_channels} (=input_channels)")
+                else:
+                    # 其他stage保持与前一个stage相同
+                    prev_stage_channels = config['stages'][stage_idx - 1]['channels']
+                    new_channels = int(prev_stage_channels)
+                    print(f"  - Stage {stage_idx} (SeDpConv): 保持 {new_channels} (=前stage输出)")
+
+            else:
+                # 普通卷积：从合法选项中找到最接近目标的值（但不超过原值）
+                new_channels = self._find_closest_valid_channel(
+                    target_channels, valid_channels, max_value=old_channels
+                )
+                print(f"  - Stage {stage_idx} 通道: {old_channels} → {new_channels}")
+            
+            stage['channels'] = new_channels
+        
+        # 策略2: 如果还不够，减少 blocks 数量（优先移除非SeDpConv的blocks）
+        if reduction_ratio < 0.7:
+            print(f"⚠️ 缩减比例 < 0.7，开始移除blocks...")
+            for stage in reversed(config['stages']):  # 从后往前
+                if len(stage['blocks']) > 1:
+                    # 优先移除非 SeDpConv 的 block
+                    for i in range(len(stage['blocks']) - 1, -1, -1):
+                        if stage['blocks'][i].get('type') != 'SeDpConv':
+                            removed = stage['blocks'].pop(i)
+                            print(f"  - 移除 block : {removed['type']}")
+                            break
+                    else:
+                        # 如果都是SeDpConv，移除最后一个
+                        removed = stage['blocks'].pop()
+                        print(f"  - 移除 block : {removed['type']}")
+                    break  # 每次只移除一个
+        
+        # 策略3: 如果还不够，减少stages（从最后开始移除，避免移除包含SeDpConv的第一个stage）
+        if reduction_ratio < 0.5 and len(config['stages']) > 2:
+            print(f"⚠️ 缩减比例 < 0.5，开始移除stage...")
+            # 从最后一个stage开始移除（保护第一个stage）
+            removed_stage = config['stages'].pop()
+            print(f"  - 移除整个stage (原通道数: {removed_stage['channels']})")
+        
+        # 策略4: 如果还是不够，进一步缩减expansion
+        if reduction_ratio < 0.4:
+            print(f"⚠️ 缩减比例 < 0.4，开始缩减expansion...")
+            valid_expansions = self.search_space.get('expansions', [1, 2, 3, 4])
+            # ✅ 确保是整数
+            valid_expansions = sorted([int(e) for e in valid_expansions])
+            min_expansion = min(valid_expansions)
+            
+            for stage in config['stages']:
+                for block in stage['blocks']:
+                    current_expansion = int(block.get('expansion', 1))
+                    if current_expansion > min_expansion:
+                        # 选择比当前小的最大expansion
+                        smaller_expansions = [e for e in valid_expansions if e < current_expansion]
+                        if smaller_expansions:
+                            old_expansion = current_expansion
+                            block['expansion'] = max(smaller_expansions)
+                            print(f"  - 缩减block expansion: {old_expansion} → {block['expansion']}")
+        
+        return config
+
+    def _find_closest_valid_channel(self, target: int, valid_options: list, max_value: int = None) -> int:
+        """
+        从合法选项中找到最接近目标值的通道数
+        
+        Args:
+            target: 目标通道数（整数）
+            valid_options: 合法的通道数列表（必须已排序，且都是整数）
+            max_value: 最大值限制（不能超过原值）
+        
+        Returns:
+            最接近目标的合法通道数
+        """
+        # ✅ 确保所有输入都是整数
+        target = int(target)
+        valid_options = [int(c) for c in valid_options]
+        
+        if max_value is not None:
+            max_value = int(max_value)
+            # 过滤掉超过最大值的选项
+            valid_options = [c for c in valid_options if c <= max_value]
+        
+        if not valid_options:
+            return 8  # 最小默认值
+        
+        # 如果目标小于最小合法值，返回最小值
+        if target <= valid_options[0]:
+            return valid_options[0]
+        
+        # 如果目标大于最大合法值，返回最大值
+        if target >= valid_options[-1]:
+            return valid_options[-1]
+        
+        # 找到最接近的值
+        closest = min(valid_options, key=lambda x: abs(x - target))
+        return closest
     
     def _validate_and_fix_block(self, block: Dict[str, Any], stage_idx: int, block_idx: int, 
                               current_channels: int, stage_channels: int, input_channels: int) -> bool:
@@ -398,8 +567,25 @@ class LLMConfigGenerator:
     
     def _generate_base_config(self, direction: str) -> Dict[str, Any]:
         """生成基础配置（回退方案）"""
+        import random
         print(f"生成基础配置，方向: {direction}")
         
+        # 随机化参数
+        stage1_channels = random.choice([8, 12, 16])
+        stage2_channels = random.choice([16, 24, 32])
+
+        conv_types = ["DWSepConv", "MBConv", "SeSepConv"]
+        activations = ["ReLU", "ReLU6", "Swish"]
+
+        # 随机选择第一个stage的卷积类型
+        stage1_type = random.choice(conv_types)
+        stage1_expansion = 1 if stage1_type == "DWSepConv" else random.choice([2, 3, 4])
+        stage1_has_se = random.choice([True, False])
+        
+        # 随机选择第二个stage的卷积类型
+        stage2_type = random.choice(["MBConv", "SeSepConv"])
+        stage2_expansion = random.choice([2, 3, 4, 6])
+
         base_config = {
             "input_channels": self.dataset_info['channels'],
             "num_classes": self.dataset_info['num_classes'],
@@ -408,32 +594,32 @@ class LLMConfigGenerator:
                 {
                     "blocks": [
                         {
-                            "type": "DWSepConv",
-                            "kernel_size": 3,
+                            "type": stage1_type,
+                            "kernel_size": random.choice([3, 5]),
                             "stride": 1,
-                            "expansion": 1,
-                            "has_se": False,
-                            "se_ratio": 0,
-                            "skip_connection": False,
-                            "activation": "ReLU6"
+                            "expansion": stage1_expansion,
+                            "has_se": stage1_has_se,
+                            "se_ratio": 0.25 if stage1_has_se else 0,
+                            "skip_connection": stage1_type in ["DWSepConv", "MBConv"],
+                            "activation": random.choice(activations)
                         }
                     ],
-                    "channels": 8
+                    "channels": stage1_channels
                 },
                 {
                     "blocks": [
                         {
-                            "type": "MBConv",
-                            "kernel_size": 3,
+                            "type": stage2_type,
+                            "kernel_size": random.choice([3, 5, 7]),
                             "stride": 2,
-                            "expansion": 2,
+                            "expansion": stage2_expansion,
                             "has_se": True,
                             "se_ratio": 0.25,
                             "skip_connection": True,
-                            "activation": "Swish"
+                            "activation": random.choice(activations)
                         }
                     ],
-                    "channels": 16
+                    "channels": stage2_channels
                 }
             ]
         }

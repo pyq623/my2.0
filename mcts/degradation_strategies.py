@@ -85,12 +85,13 @@ class ConfigDegradationManager:
                             "kernel_size": 3,
                             "stride": 1,
                             "expansion": 1,
-                            "has_se": False,
+                            "has_se": True,
+                            "se_ratio": 0.25, # 使用较小的SE比例
                             "activation": "ReLU",
-                            "skip_connection": True
+                            "skip_connection": False  # 避免跳跃连接以节省内存
                         }
                     ],
-                    "channels": 8
+                    "channels": self.dataset_info["channels"]  # 🟢 修复：等于 input_channels
                 }
             ]
         }
@@ -163,8 +164,24 @@ class ConfigDegradationManager:
                 # 尝试更小的类型
                 for smaller_type in conv_type_priority[current_priority + 1:]:
                     block["type"] = smaller_type
-                    memory_ok, new_memory, _ = self.check_memory_fn(temp_config)
+                    # 🟢 调整属性
+                    if smaller_type == "SeDpConv":
+                        block["has_se"] = True
+                        block["se_ratio"] = 0.25
+                        block["skip_connection"] = False
+
+                        # 🟢 修复通道约束
+                        if stage_idx == 0 and block_idx == 0:
+                            temp_config["stages"][stage_idx]["channels"] = self.dataset_info["channels"]
+                        elif stage_idx > 0:
+                            prev_channels = temp_config["stages"][stage_idx - 1]["channels"]
+                            temp_config["stages"][stage_idx]["channels"] = prev_channels
+                    elif smaller_type in ["SeSepConv"]:
+                        block["has_se"] = True
+                        block["se_ratio"] = 0.25
+                        block["skip_connection"] = False        
                     
+                    memory_ok, new_memory, _ = self.check_memory_fn(temp_config)
                     if memory_ok:
                         print(f"✅ Stage{stage_idx}-Block{block_idx}: {current_type} → {smaller_type}")
                         return temp_config
@@ -182,6 +199,21 @@ class ConfigDegradationManager:
         for stage_idx in range(len(config.get("stages", [])) - 1, -1, -1):
             stage = config["stages"][stage_idx]
             original_channels = stage["channels"]
+            
+            # 🟢 检查是否包含 SeDpConv
+            has_sedpconv = any(b.get("type") == "SeDpConv" for b in stage.get("blocks", []))
+
+            if has_sedpconv:
+                # SeDpConv stage 的 channels 必须保持特定值
+                if stage_idx == 0:
+                    required_channels = self.dataset_info["channels"]
+                else:
+                    required_channels = config["stages"][stage_idx - 1]["channels"]
+                
+                if stage["channels"] != required_channels:
+                    print(f"🔧 Stage{stage_idx} (SeDpConv): 强制 channels = {required_channels}")
+                    stage["channels"] = required_channels
+                continue  # 跳过这个 stage
             
             for reduction_factor in [0.75, 0.5, 0.25]:
                 new_channels = max(8, int(original_channels * reduction_factor))
